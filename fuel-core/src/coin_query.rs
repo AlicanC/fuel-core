@@ -263,8 +263,6 @@ pub fn random_improve(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
     use assert_matches::assert_matches;
     use fuel_asm::Word;
     use fuel_tx::{Address, Bytes32};
@@ -273,29 +271,57 @@ mod tests {
 
     use super::*;
 
-    static COIN_INDEX: AtomicU8 = AtomicU8::new(0);
-    fn make_coin(owner: Address, amount: Word, asset_id: AssetId) -> (UtxoId, Coin) {
-        let index = COIN_INDEX.fetch_add(1, Ordering::SeqCst);
-        let utxo_id = UtxoId::new(Bytes32::from([0u8; 32]), index);
-        let coin = Coin {
-            owner,
-            amount,
-            asset_id,
-            maturity: Default::default(),
-            status: CoinStatus::Unspent,
-            block_created: Default::default(),
-        };
-        (utxo_id, coin)
+    struct TestDatabase {
+        database: Database,
+        last_coin_index: u64,
     }
 
-    fn gen_test_db(coins: &[(UtxoId, Coin)]) -> Database {
-        let mut db = Database::default();
-
-        for (id, coin) in coins {
-            Storage::<UtxoId, Coin>::insert(&mut db, id, coin).unwrap();
+    impl TestDatabase {
+        fn new() -> Self {
+            let database = Database::default();
+            Self {
+                database,
+                last_coin_index: 0,
+            }
         }
 
-        db
+        fn db(&self) -> &Database {
+            &self.database
+        }
+
+        fn make_coin(&mut self, owner: Address, amount: Word, asset_id: AssetId) -> (UtxoId, Coin) {
+            let index = self.last_coin_index;
+            self.last_coin_index += 1;
+
+            let id = UtxoId::new(Bytes32::from([0u8; 32]), index.try_into().unwrap());
+            let coin = Coin {
+                owner,
+                amount,
+                asset_id,
+                maturity: Default::default(),
+                status: CoinStatus::Unspent,
+                block_created: Default::default(),
+            };
+
+            Storage::<UtxoId, Coin>::insert(&mut self.database, &id, &coin).unwrap();
+
+            (id, coin)
+        }
+
+        fn owned_coins(&self, owner: Address) -> Vec<(UtxoId, Coin)> {
+            self.database
+                .owned_coins(owner, None, None)
+                .map(|res| {
+                    res.map(|id| {
+                        let coin = Storage::<UtxoId, Coin>::get(&self.database, &id)
+                            .unwrap()
+                            .unwrap();
+                        (id, coin.into_owned())
+                    })
+                })
+                .try_collect()
+                .unwrap()
+        }
     }
 
     #[test]
@@ -303,19 +329,15 @@ mod tests {
         // Setup
         let owner = Address::default();
         let asset_ids = [AssetId::new([1u8; 32]), AssetId::new([2u8; 32])];
-        let coins: Vec<(UtxoId, Coin)> = (0..5usize)
-            .flat_map(|i| {
-                [
-                    make_coin(owner, (i + 1) as Word, asset_ids[0]),
-                    make_coin(owner, (i + 1) as Word, asset_ids[1]),
-                ]
-            })
-            .collect();
-        let db = gen_test_db(&coins);
+        let mut test_db = TestDatabase::new();
+        (0..5usize).for_each(|i| {
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[0]);
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[1]);
+        });
         let query = |spend_query: &[SpendQueryElement],
                      max_inputs: u8|
          -> Result<Vec<(AssetId, u64)>, CoinQueryError> {
-            let coins = largest_first(&db, spend_query, max_inputs, None);
+            let coins = largest_first(test_db.db(), spend_query, max_inputs, None);
 
             // Transform result for convenience
             coins.map(|coins| {
@@ -385,19 +407,15 @@ mod tests {
         // Setup
         let owner = Address::default();
         let asset_ids = [AssetId::new([1u8; 32]), AssetId::new([2u8; 32])];
-        let coins: Vec<(UtxoId, Coin)> = (0..5usize)
-            .flat_map(|i| {
-                [
-                    make_coin(owner, (i + 1) as Word, asset_ids[0]),
-                    make_coin(owner, (i + 1) as Word, asset_ids[1]),
-                ]
-            })
-            .collect();
-        let db = gen_test_db(&coins);
+        let mut test_db = TestDatabase::new();
+        (0..5usize).for_each(|i| {
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[0]);
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[1]);
+        });
         let query = |spend_query: &[SpendQueryElement],
                      max_inputs: u8|
          -> Result<Vec<(AssetId, u64)>, CoinQueryError> {
-            let coins = random_improve(&db, spend_query, max_inputs, None);
+            let coins = random_improve(test_db.db(), spend_query, max_inputs, None);
 
             // Transform result for convenience
             coins.map(|coins| {
@@ -491,20 +509,16 @@ mod tests {
         // Setup
         let owner = Address::default();
         let asset_ids = [AssetId::new([1u8; 32]), AssetId::new([2u8; 32])];
-        let coins: Vec<(UtxoId, Coin)> = (0..5usize)
-            .flat_map(|i| {
-                [
-                    make_coin(owner, (i + 1) as Word, asset_ids[0]),
-                    make_coin(owner, (i + 1) as Word, asset_ids[1]),
-                ]
-            })
-            .collect();
-        let db = gen_test_db(&coins);
+        let mut test_db = TestDatabase::new();
+        (0..5usize).for_each(|i| {
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[0]);
+            test_db.make_coin(owner, (i + 1) as Word, asset_ids[1]);
+        });
         let query = |spend_query: &[SpendQueryElement],
                      max_inputs: u8,
                      excluded_ids: Option<&Vec<UtxoId>>|
          -> Result<Vec<(AssetId, u64)>, CoinQueryError> {
-            let coins = random_improve(&db, spend_query, max_inputs, excluded_ids);
+            let coins = random_improve(test_db.db(), spend_query, max_inputs, excluded_ids);
 
             // Transform result for convenience
             coins.map(|coins| {
@@ -522,7 +536,8 @@ mod tests {
         };
 
         // Exclude largest coin IDs
-        let excluded_ids = coins
+        let excluded_ids = test_db
+            .owned_coins(owner)
             .into_iter()
             .filter(|(_, coin)| coin.amount == 5)
             .map(|(utxo_id, _)| utxo_id)
